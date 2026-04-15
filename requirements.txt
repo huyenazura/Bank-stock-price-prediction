@@ -1,0 +1,9 @@
+vnstock
+pandas
+numpy
+matplotlib
+scikit-learn
+torch
+tqdm
+
+#pip freeze > requirements.txt
