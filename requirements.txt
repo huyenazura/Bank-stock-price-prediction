@@ -7,3 +7,8 @@ torch
 tqdm
 
 #pip freeze > requirements.txt
+# lưu ý khi lỗi data =>>>>> pip install vnstock -U 
+# python train.py           # cả 2 pha
+# python train.py --phase 1 # chỉ pretrain VCB
+# python train.py --phase 2 # chỉ finetune (cần pha 1 xong trước)
+# python evaluate.py        # đánh giá toàn bộ
