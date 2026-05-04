@@ -1,14 +1,8 @@
-vnstock
-pandas
-numpy
-matplotlib
-scikit-learn
-torch
-tqdm
-
-#pip freeze > requirements.txt
-# lưu ý khi lỗi data =>>>>> pip install vnstock -U 
-# python train.py           # cả 2 pha
-# python train.py --phase 1 # chỉ pretrain VCB
-# python train.py --phase 2 # chỉ finetune (cần pha 1 xong trước)
-# python evaluate.py        # đánh giá toàn bộ
+vnstock>=0.3.0
+pandas>=2.0.0
+numpy>=1.24.0
+torch>=2.0.0
+scikit-learn>=1.3.0
+streamlit>=1.28.0
+plotly>=5.17.0
+requests>=2.31.0

@@ -1,770 +1,774 @@
-"""
-app.py — Streamlit dashboard dự báo giá cổ phiếu ngân hàng Việt Nam.
+# ============================================================
+# ỨNG DỤNG STREAMLIT - Hỗ trợ quyết định đầu tư cổ phiếu ngân hàng
+# ============================================================
 
-Chạy:  streamlit run app.py
-
-Trang 1 — Tổng quan     : Giá cao nhất / thấp nhất, tương quan 30 NH
-Trang 2 — Chi tiết NH   : Biểu đồ phân tích + dự báo ML (model tốt nhất)
-Trang 3 — Đánh giá ML   : RMSE / MAE / R² — bảng so sánh + biểu đồ
-Trang 4 — Tin tức       : NewsAPI theo từng mã ngân hàng
-"""
-
-import os
-import json
-import math
-import numpy as np
-import pandas as pd
-import torch
-import requests
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-from matplotlib.ticker import PercentFormatter
-from datetime import datetime, timedelta
 import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+import plotly.express as px
+import torch, pickle, os, sys
+import feedparser
+from datetime import datetime, timedelta
 
-import config
-from models_def import build_model
-from data_utils import fetch_data, preprocess_data
+sys.path.append("src")
+from models import MODEL_REGISTRY, LinearModel, DLinearModel, NLinearModel
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Cấu hình trang
-# ─────────────────────────────────────────────────────────────────────────────
-
+# ── Cấu hình trang ──────────────────────────────────────────
 st.set_page_config(
-    page_title="VN Bank Forecast",
+    page_title="VN Bank Stock Forecast",
     page_icon="🏦",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="expanded"
 )
 
-# CSS tuỳ chỉnh — màu chủ đạo xanh navy / vàng tài chính
+# ── CSS tùy chỉnh ───────────────────────────────────────────
 st.markdown("""
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;600;700&family=IBM+Plex+Mono&display=swap');
-    html, body, [class*="css"] { font-family: 'IBM Plex Sans', sans-serif; }
-    .main { background-color: #0d1117; }
-    .block-container { padding: 1.5rem 2rem; }
-    h1, h2, h3 { color: #e6edf3; font-weight: 700; letter-spacing: -0.5px; }
-    .metric-card {
-        background: linear-gradient(135deg, #161b22, #1c2128);
-        border: 1px solid #30363d;
-        border-radius: 10px;
-        padding: 1rem 1.2rem;
-        margin-bottom: 0.5rem;
-    }
-    .metric-label { color: #8b949e; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 1px; }
-    .metric-value { color: #f0f6fc; font-size: 1.6rem; font-weight: 700; font-family: 'IBM Plex Mono'; }
-    .metric-delta-pos { color: #3fb950; font-size: 0.9rem; }
-    .metric-delta-neg { color: #f85149; font-size: 0.9rem; }
-    .news-card {
-        background: #161b22; border: 1px solid #30363d; border-radius: 8px;
-        padding: 1rem; margin-bottom: 0.8rem;
-    }
-    .news-title { color: #58a6ff; font-weight: 600; font-size: 0.95rem; }
-    .news-meta  { color: #8b949e; font-size: 0.78rem; margin-top: 4px; }
-    .news-desc  { color: #c9d1d9; font-size: 0.85rem; margin-top: 6px; line-height: 1.5; }
-    .stSelectbox label, .stSlider label { color: #8b949e !important; }
-    div[data-testid="metric-container"] { background: #161b22; border: 1px solid #30363d;
-        border-radius: 8px; padding: 0.8rem; }
+  [data-testid="stAppViewContainer"] { background: #0a0e1a; color: #e2e8f0; }
+  [data-testid="stSidebar"]          { background: #0f1629; }
+  .metric-card {
+      background: linear-gradient(135deg, #1a2035, #1e2a45);
+      border: 1px solid #2d3f6e;
+      border-radius: 12px;
+      padding: 20px;
+      text-align: center;
+  }
+  .metric-card .label { color: #94a3b8; font-size: 13px; margin-bottom: 6px; }
+  .metric-card .value { color: #38bdf8; font-size: 26px; font-weight: 700; }
+  .news-card {
+      background: #111827;
+      border-left: 3px solid #3b82f6;
+      border-radius: 8px;
+      padding: 14px 18px;
+      margin-bottom: 12px;
+  }
+  .news-card a { color: #60a5fa; text-decoration: none; font-weight: 600; }
+  .news-card .news-meta { color: #6b7280; font-size: 12px; margin-top: 6px; }
 </style>
 """, unsafe_allow_html=True)
 
-plt.rcParams.update({
-    "figure.facecolor" : "#0d1117",
-    "axes.facecolor"   : "#0d1117",
-    "axes.edgecolor"   : "#30363d",
-    "axes.labelcolor"  : "#8b949e",
-    "text.color"       : "#c9d1d9",
-    "xtick.color"      : "#8b949e",
-    "ytick.color"      : "#8b949e",
-    "grid.color"       : "#21262d",
-    "grid.alpha"       : 0.8,
-    "legend.facecolor" : "#161b22",
-    "legend.edgecolor" : "#30363d",
-})
+INPUT_LEN = 60
+PRED_LENS = {"1 ngày (1 phiên)": 1, "1 tuần (5 phiên)": 5, "1 tháng (21 phiên)": 21}
 
+BANK_TICKERS = [
+    "VCB","BID","CTG","TCB","MBB","ACB","VPB","STB","HDB","TPB",
+    "VIB","MSB","OCB","SHB","LPB","EIB","NAB","PGB","ABB","BVB"
+]
+BANK_NAMES = {
+    "VCB":"Vietcombank","BID":"BIDV","CTG":"VietinBank","TCB":"Techcombank",
+    "MBB":"MB Bank","ACB":"ACB","VPB":"VPBank","STB":"Sacombank",
+    "HDB":"HDBank","TPB":"TPBank","VIB":"VIB","MSB":"MSB","OCB":"OCB",
+    "SHB":"SHB","LPB":"LPBank","EIB":"Eximbank","NAB":"Nam A Bank",
+    "PGB":"PG Bank","ABB":"ABBank","BVB":"Bao Viet Bank"
+}
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Cache helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Hàm tiện ích ────────────────────────────────────────────
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_stock(symbol: str):
-    df = fetch_data(symbol, config.START_DATE, config.END_DATE, verbose=False)
-    if df is None:
-        return None
-    df["time"]         = pd.to_datetime(df["time"])
-    df                 = df.sort_values("time").reset_index(drop=True)
-    df["daily_return"] = df["close"].pct_change().fillna(0)
-    df["close_log"]    = np.log(df["close"])
-    df["ma20"]         = df["close"].rolling(20).mean().bfill()
-    df["ma60"]         = df["close"].rolling(60).mean().bfill()
+@st.cache_data(ttl=3600)
+def load_data():
+    path = "data/processed/clean_data.csv"
+    if not os.path.exists(path):
+        st.error("⚠️ Chưa có dữ liệu. Hãy chạy pipeline từ src/ trước.")
+        st.stop()
+    df = pd.read_csv(path, parse_dates=["time"])
     return df
 
 
-@st.cache_data(ttl=7200, show_spinner=False)
-def load_all_stocks():
+def load_model_cached(ticker, model_name, pred_len):
+    ModelClass = MODEL_REGISTRY[model_name]
+    model      = ModelClass(INPUT_LEN, pred_len)
+    path       = f"data/models/{ticker}_{model_name}_pred{pred_len}.pt"
+    if not os.path.exists(path):
+        return None
+    model.load_state_dict(torch.load(path, map_location="cpu"))
+    model.eval()
+    return model
+
+
+def predict(ticker, pred_len, prices, scaler):
+    """Chạy cả 3 mô hình, trả về dict {model_name: array giá dự đoán}."""
+    if len(prices) < INPUT_LEN:
+        return {}
+    scaled  = scaler.transform(prices.reshape(-1, 1)).flatten()
+    x_input = torch.tensor(scaled[-INPUT_LEN:], dtype=torch.float32).unsqueeze(0)
+
     results = {}
-    prog    = st.progress(0, text="Đang tải dữ liệu 30 ngân hàng...")
-    for i, sym in enumerate(config.SYMBOLS):
-        results[sym] = load_stock(sym)
-        prog.progress((i + 1) / len(config.SYMBOLS), text=f"Đang tải {sym}...")
-    prog.empty()
+    for name in MODEL_REGISTRY:
+        m = load_model_cached(ticker, name, pred_len)
+        if m is None:
+            continue
+        with torch.no_grad():
+            out = m(x_input).numpy().flatten()
+        results[name] = scaler.inverse_transform(out.reshape(-1, 1)).flatten()
     return results
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def load_summary_csv():
-    path = "logs/summary.csv"
+def load_scaler(ticker):
+    path = f"data/models/{ticker}_scaler.pkl"
     if not os.path.exists(path):
         return None
-    return pd.read_csv(path)
+    with open(path, "rb") as f:
+        return pickle.load(f)
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def load_best_models_csv():
-    path = "logs/best_models.csv"
-    if not os.path.exists(path):
-        return None
-    df = pd.read_csv(path)
-    df.columns = [c.lower() for c in df.columns]
-    return df
+# ── RSS Feeds tài chính Việt Nam (miễn phí, không cần API key) ──
+RSS_FEEDS = [
+    "https://cafef.vn/thi-truong-chung-khoan.rss",   # CafeF – chứng khoán
+    "https://cafef.vn/ngan-hang.rss",                 # CafeF – ngân hàng
+    "https://vnexpress.net/rss/kinh-doanh.rss",       # VnExpress – kinh doanh
+    "https://vnexpress.net/rss/kinh-doanh/chung-khoan.rss",  # VnExpress – chứng khoán
+    "https://vietstock.vn/820/chung-khoan.rss",       # Vietstock
+]
 
+ALIAS_MAP = {
+    "VCB": ["vietcombank"],
+    "BID": ["bidv"],
+    "CTG": ["vietinbank"],
+    "TCB": ["techcombank"],
+    "MBB": ["mb bank", "mbbank"],
+    "VPB": ["vpbank"],
+    "STB": ["sacombank"],
+    "HDB": ["hdbank"],
+    "TPB": ["tpbank"],
+    "SHB": ["shb"],
+    "LPB": ["lpbank", "lienvietpostbank"],
+    "EIB": ["eximbank"],
+    "ACB": ["acb"],
+    "VIB": ["vib"],
+    "MSB": ["msb"],
+    "OCB": ["ocb"],
+    "NAB": ["nam a bank"],
+    "PGB": ["pg bank"],
+    "ABB": ["abbank"],
+    "BVB": ["bao viet bank"],
+}
 
-def get_best_model_name(symbol: str, window: int) -> str:
-    """Trả về tên model tốt nhất cho (symbol, window) từ best_models.csv."""
-    best = load_best_models_csv()
-    if best is None:
-        return "NLinear"   # fallback
-    row = best[(best["symbol"] == symbol) & (best["window"] == window)]
-    if row.empty:
-        return "NLinear"
-    return row.iloc[0]["model"]
+def _parse_date(entry) -> str:
+    for attr in ("published_parsed", "updated_parsed"):
+        t = getattr(entry, attr, None)
+        if t:
+            try:
+                return datetime(*t[:3]).strftime("%Y-%m-%d")
+            except Exception:
+                pass
+    return datetime.today().strftime("%Y-%m-%d")
 
+@st.cache_data(ttl=1800)
+def fetch_news(ticker, max_results: int = 10):
+    bank_name = BANK_NAMES.get(ticker, ticker)
+    keywords  = [ticker.lower(), bank_name.lower()] + ALIAS_MAP.get(ticker, [])
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Dự báo
-# ─────────────────────────────────────────────────────────────────────────────
+    collected = []
+    seen_urls = set()
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_prediction(symbol: str, model_name: str, window: int):
-    """
-    Dự báo toàn bộ tập dữ liệu, inverse transform → VND.
-    Trả về (preds, actuals) hoặc (None, None).
-    """
-    path = f"models/{model_name.lower()}_{symbol}_{window}d.pth"
-    if not os.path.exists(path):
-        return None, None
+    for feed_url in RSS_FEEDS:
+        try:
+            feed = feedparser.parse(feed_url)
+            for entry in feed.entries:
+                title   = entry.get("title", "")
+                summary = entry.get("summary", "")
+                text    = (title + " " + summary).lower()
 
-    df = load_stock(symbol)
-    if df is None:
-        return None, None
+                if not any(kw in text for kw in keywords):
+                    continue
 
-    data = preprocess_data(df, verbose=False)
+                url = entry.get("link", "#")
+                if url in seen_urls:
+                    continue
+                seen_urls.add(url)
 
-    inputs = np.array([data[i : i + window] for i in range(len(data) - window)])
-    X      = torch.FloatTensor(inputs)
+                # ── Lấy ảnh thumbnail ──────────────────────────
+                image_url = ""
 
-    model = build_model(model_name, window, config.HIDDEN_SIZE)
-    try:
-        model.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
-    except Exception:
-        return None, None
-    model.eval()
+                # Cách 1: media_thumbnail (phổ biến nhất)
+                if hasattr(entry, "media_thumbnail") and entry.media_thumbnail:
+                    image_url = entry.media_thumbnail[0].get("url", "")
 
-    with torch.no_grad():
-        lr_preds = model(X).numpy().flatten()
+                # Cách 2: media_content
+                if not image_url and hasattr(entry, "media_content") and entry.media_content:
+                    image_url = entry.media_content[0].get("url", "")
 
-    close   = df["close"].values
-    base    = close[window : window + len(lr_preds)]
-    preds   = base * np.exp(lr_preds)
-    actuals = close[window + 1 : window + 1 + len(lr_preds)]
-    min_len = min(len(preds), len(actuals))
-    if min_len == 0:
-        return None, None
-    return preds[:min_len], actuals[:min_len]
+                # Cách 3: enclosures (podcast/image RSS)
+                if not image_url and hasattr(entry, "enclosures") and entry.enclosures:
+                    for enc in entry.enclosures:
+                        if "image" in enc.get("type", ""):
+                            image_url = enc.get("url", "")
+                            break
 
+                # Cách 4: parse thẻ <img> trong summary HTML
+                if not image_url and summary:
+                    import re
+                    match = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', summary)
+                    if match:
+                        image_url = match.group(1)
 
-def next_day_forecast(symbol: str, window: int):
-    """Dự báo giá phiên tiếp theo (VND) dùng model tốt nhất."""
-    best_name = get_best_model_name(symbol, window)
-    path      = f"models/{best_name.lower()}_{symbol}_{window}d.pth"
-    if not os.path.exists(path):
-        return None, best_name
+                # ── Clean summary (bỏ HTML tags) ───────────────
+                import re
+                clean_summary = re.sub(r"<[^>]+>", "", summary).strip()
+                clean_summary = clean_summary[:200] + "..." if len(clean_summary) > 200 else clean_summary
 
-    df = load_stock(symbol)
-    if df is None:
-        return None, best_name
+                collected.append({
+                    "title":     title,
+                    "url":       url,
+                    "source":    feed.feed.get("title", ""),
+                    "published": _parse_date(entry),
+                    "summary":   clean_summary,
+                    "image":     image_url,
+                })
 
-    data = preprocess_data(df, verbose=False)
-    if len(data) < window:
-        return None, best_name
+                if len(collected) >= max_results:
+                    break
+        except Exception:
+            continue
 
-    x = torch.FloatTensor(data[-window:]).unsqueeze(0)   # [1, window, 1]
-    model = build_model(best_name, window, config.HIDDEN_SIZE)
-    try:
-        model.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
-    except Exception:
-        return None, best_name
-    model.eval()
+        if len(collected) >= max_results:
+            break
 
-    with torch.no_grad():
-        lr_pred = model(x).item()
+    collected.sort(key=lambda x: x["published"], reverse=True)
 
-    last_close = df["close"].iloc[-1]
-    return last_close * math.exp(lr_pred), best_name
+    if not collected:
+        return [
+            {
+                "title":     f"[Mẫu] Cập nhật kết quả kinh doanh {bank_name} Quý gần nhất",
+                "url":       "#", "source": "CafeF",
+                "published": datetime.today().strftime("%Y-%m-%d"),
+                "summary":   "Thông tin kết quả kinh doanh mới nhất của ngân hàng.",
+                "image":     "",
+            },
+            {
+                "title":     f"[Mẫu] {bank_name} công bố kế hoạch tăng vốn điều lệ",
+                "url":       "#", "source": "VnExpress",
+                "published": datetime.today().strftime("%Y-%m-%d"),
+                "summary":   "Kế hoạch tăng vốn điều lệ trong năm tới của ngân hàng.",
+                "image":     "",
+            },
+        ]
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Plot helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _date_axis(ax):
-    ax.xaxis.set_major_locator(mdates.YearLocator())
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
-    ax.grid(True, alpha=0.4, linestyle="--")
-    ax.tick_params(labelsize=8)
-
-
-def fig_price(df):
-    fig, ax = plt.subplots(figsize=(9, 3.5))
-    ax.plot(df["time"], df["close"], color="#58a6ff", linewidth=1.5, label="Close")
-    ax.plot(df["time"], df["ma20"],  color="#f0883e", linewidth=1,
-            linestyle="--", label="MA20", alpha=0.85)
-    ax.plot(df["time"], df["ma60"],  color="#bc8cff", linewidth=1,
-            linestyle=":",  label="MA60", alpha=0.85)
-    ax.set_ylabel("Giá (nghìn đồng)")
-    ax.legend(fontsize=8)
-    _date_axis(ax)
-    fig.tight_layout()
-    return fig
-
-
-def fig_log_price(df):
-    fig, ax = plt.subplots(figsize=(9, 3.5))
-    ax.plot(df["time"], df["close_log"], color="#3fb950", linewidth=1.5)
-    ax.set_ylabel("Ln(Giá)")
-    _date_axis(ax)
-    fig.tight_layout()
-    return fig
-
-
-def fig_daily_return(df):
-    fig, ax = plt.subplots(figsize=(9, 3.5))
-    colors  = ["#3fb950" if r >= 0 else "#f85149" for r in df["daily_return"]]
-    ax.bar(df["time"], df["daily_return"], color=colors, width=1.5, alpha=0.7)
-    ax.plot(df["time"], df["daily_return"].rolling(20).mean(),
-            color="#f0883e", linewidth=1.2, label="MA20")
-    ax.axhline(0, color="#8b949e", linewidth=0.8)
-    ax.yaxis.set_major_formatter(PercentFormatter(1.0))
-    ax.set_ylabel("Biến động ngày")
-    ax.legend(fontsize=8)
-    _date_axis(ax)
-    fig.tight_layout()
-    return fig
-
-
-def fig_volume(df):
-    fig, ax = plt.subplots(figsize=(9, 3.5))
-    ax.fill_between(df["time"], df["volume"], color="#58a6ff", alpha=0.4)
-    ax.plot(df["time"], df["volume"], color="#58a6ff", linewidth=0.8)
-    ax.set_ylabel("Khối lượng")
-    _date_axis(ax)
-    fig.tight_layout()
-    return fig
-
-
-def fig_forecast(symbol: str, window: int, n_recent: int = 60):
-    best_name           = get_best_model_name(symbol, window)
-    preds, actuals      = get_prediction(symbol, best_name, window)
-    horizon_label       = config.PRED_HORIZONS.get(window, f"{window}d")
-
-    fig, ax = plt.subplots(figsize=(9, 3.8))
-
-    if preds is None:
-        ax.text(0.5, 0.5, f"Chưa có weight: {best_name}\nChạy train.py trước",
-                ha="center", va="center", transform=ax.transAxes,
-                color="#f85149", fontsize=11)
-        fig.tight_layout()
-        return fig, best_name, None, None
-
-    show_p = preds[-n_recent:]
-    show_a = actuals[-n_recent:]
-    x      = np.arange(len(show_a))
-
-    ax.plot(x, show_a, color="#c9d1d9", linewidth=1.8, label="Thực tế", zorder=5)
-    ax.plot(x, show_p, color="#f0883e", linewidth=1.5, linestyle="--",
-            alpha=0.9, label=f"Dự báo ({best_name})", zorder=4)
-    ax.fill_between(x, show_a, show_p, alpha=0.08, color="#f0883e")
-
-    ax.set_title(f"Dự báo {horizon_label}", fontsize=10, fontweight="bold", color="#e6edf3")
-    ax.set_ylabel("Giá (nghìn đồng)")
-    ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.3, linestyle="--")
-    fig.tight_layout()
-    return fig, best_name, preds, actuals
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# News
-# ─────────────────────────────────────────────────────────────────────────────
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def fetch_news(symbol: str, bank_name: str) -> list:
-    """Lấy tin tức từ NewsAPI về ngân hàng."""
-    api_key = config.NEWS_API_KEY
-    if api_key == "YOUR_NEWSAPI_KEY_HERE" or not api_key:
-        return []
-
-    query = f"{bank_name} ngân hàng {symbol}"
-    url   = (
-        f"https://newsapi.org/v2/everything"
-        f"?q={requests.utils.quote(query)}"
-        f"&language={config.NEWS_LANGUAGE}"
-        f"&pageSize={config.NEWS_PAGE_SIZE}"
-        f"&sortBy=publishedAt"
-        f"&apiKey={api_key}"
-    )
-    try:
-        resp = requests.get(url, timeout=8)
-        data = resp.json()
-        return data.get("articles", [])
-    except Exception:
-        return []
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Sidebar
-# ─────────────────────────────────────────────────────────────────────────────
-
+    return collected
+# ── Sidebar ─────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## 🏦 VN Bank Forecast")
-    st.caption(f"Cập nhật: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
-    st.divider()
-
+    st.markdown("---")
     page = st.radio(
-        "Điều hướng",
-        ["🏠 Tổng quan", "📈 Chi tiết ngân hàng", "🤖 Đánh giá mô hình", "📰 Tin tức"],
-        label_visibility="collapsed",
+        "Chọn trang",
+        ["📊 Tổng quan", "🔍 Ngân hàng", "📰 Tin tức"],
+        label_visibility="collapsed"
     )
-    st.divider()
+    st.markdown("---")
+    st.caption("Dữ liệu: vnstock | Mô hình: LTSF")
+    st.caption(f"Cập nhật: {datetime.today().strftime('%d/%m/%Y')}")
 
-    if page in ["📈 Chi tiết ngân hàng", "📰 Tin tức"]:
-        selected_symbol = st.selectbox(
-            "Chọn mã ngân hàng",
-            options=config.SYMBOLS,
-            format_func=lambda s: f"{s} — {config.BANK_NAMES.get(s, s)}",
+df = load_data()
+
+# ════════════════════════════════════════════════════════════
+# TRANG 1: TỔNG QUAN
+# ════════════════════════════════════════════════════════════
+if page == "📊 Tổng quan":
+    st.title("📊 Tổng quan thị trường cổ phiếu ngân hàng")
+
+    latest = (df.sort_values("time")
+                .groupby("ticker")
+                .last()
+                .reset_index()[["ticker", "close"]])
+    latest["bank_name"] = latest["ticker"].map(BANK_NAMES)
+
+    highest = latest.loc[latest["close"].idxmax()]
+    lowest  = latest.loc[latest["close"].idxmin()]
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # Biểu đồ bar giá hiện tại
+    st.subheader("💹 Giá đóng cửa hiện tại - 20 Ngân hàng")
+    latest_sorted = latest.sort_values("close", ascending=False)
+    fig_bar = go.Figure(go.Bar(
+        x=latest_sorted["ticker"],
+        y=latest_sorted["close"],
+        marker=dict(color=latest_sorted["close"], colorscale="Blues", showscale=False),
+        text=latest_sorted["close"].apply(lambda x: f"{x:,.0f}"),
+        textposition="outside"
+    ))
+    fig_bar.update_layout(
+        paper_bgcolor="#0a0e1a", plot_bgcolor="#0a0e1a",
+        font_color="#e2e8f0", height=400,
+        margin=dict(t=20, b=20), xaxis_tickangle=-45
+    )
+    st.plotly_chart(fig_bar, use_container_width=True)
+
+    # Biến động giá hôm nay
+    latest_2days = df.sort_values("time").groupby("ticker").tail(2)
+    latest_2days = latest_2days.copy()
+    latest_2days["daily_return"] = latest_2days.groupby("ticker")["close"].pct_change()
+    latest_change = latest_2days.groupby("ticker").last().reset_index()
+    latest_change["bank_name"] = latest_change["ticker"].map(BANK_NAMES)
+    latest_sorted2 = latest_change.sort_values("daily_return", ascending=False)
+
+    st.markdown('<div class="section-header">📅 Biến động giá hôm nay (%)</div>', unsafe_allow_html=True)
+    colors_ret = ["#34d399" if v >= 0 else "#f87171" for v in latest_sorted2["daily_return"]]
+    fig_ret = go.Figure(go.Bar(
+        x=latest_sorted2["ticker"],
+        y=latest_sorted2["daily_return"] * 100,
+        marker_color=colors_ret,
+        text=(latest_sorted2["daily_return"] * 100).apply(lambda x: f"{x:+.2f}%"),
+        textposition="outside",
+        hovertemplate="<b>%{x}</b><br>Thay đổi: %{y:+.2f}%<extra></extra>"
+    ))
+    fig_ret.add_hline(y=0, line_color="#475569", line_width=1)
+    fig_ret.update_layout(
+        paper_bgcolor="#0a0e1a", plot_bgcolor="#0a0e1a",
+        font_color="#e2e8f0", height=320,
+        margin=dict(t=20, b=20), xaxis_tickangle=-20
+    )
+    st.plotly_chart(fig_ret, use_container_width=True)
+
+    # Ma trận tương quan - Citation Network style
+    st.subheader("🔗 Mạng lưới tương quan giá đóng cửa")
+
+    import networkx as nx
+
+    pivot = df.pivot_table(index="time", columns="ticker", values="close")
+    corr  = pivot.corr()
+    tickers_corr = list(corr.columns)
+
+    # ── Tạo graph ──────────────────────────────────────────────
+    G = nx.Graph()
+    G.add_nodes_from(tickers_corr)
+
+    THRESHOLD = 0.5  # Chỉ vẽ cạnh khi tương quan >= 0.5
+    for i, t1 in enumerate(tickers_corr):
+        for j, t2 in enumerate(tickers_corr):
+            if i < j:
+                val = corr.loc[t1, t2]
+                if abs(val) >= THRESHOLD:
+                    G.add_edge(t1, t2, weight=float(val))
+
+    # ── Force-directed layout ───────────────────────────────────
+    pos = nx.spring_layout(G, seed=42, k=5.0, iterations=120)
+
+    # ── Kích thước node = trung bình tương quan tuyệt đối ──────
+    avg_corr = corr.abs().mean()
+
+    # Scale node size: min 20px, max 70px
+    min_s, max_s = avg_corr.min(), avg_corr.max()
+    node_sizes = {
+        t: 20 + ((avg_corr[t] - min_s) / (max_s - min_s + 1e-9)) * 50
+        for t in tickers_corr
+    }
+
+    # ── Vẽ edges theo nhóm màu ─────────────────────────────────
+    edge_traces = []
+    for u, v, data in G.edges(data=True):
+        x0, y0 = pos[u]
+        x1, y1 = pos[v]
+        val     = data["weight"]
+        alpha   = min(abs(val) * 0.8, 0.6)
+        color   = f"rgba(30,136,229,{alpha})" if val > 0 else f"rgba(216,90,48,{alpha})"
+        width   = 0.5 + abs(val) * 2.5
+
+        edge_traces.append(go.Scatter(
+            x=[x0, x1, None], y=[y0, y1, None],
+            mode="lines",
+            line=dict(width=width, color=color),
+            hoverinfo="none",
+            showlegend=False,
+        ))
+
+    # ── Vẽ nodes ───────────────────────────────────────────────
+    node_x      = [pos[t][0] for t in tickers_corr]
+    node_y      = [pos[t][1] for t in tickers_corr]
+    node_size   = [node_sizes[t] for t in tickers_corr]
+    node_color  = [avg_corr[t] for t in tickers_corr]
+    node_hover  = [
+        f"<b>{t} — {BANK_NAMES.get(t, t)}</b><br>"
+        f"Tương quan TB: {avg_corr[t]:.2f}<br>"
+        f"Số kết nối: {G.degree(t)}"
+        for t in tickers_corr
+    ]
+
+    node_trace = go.Scatter(
+        x=node_x, y=node_y,
+        mode="markers+text",
+        marker=dict(
+            size=node_size,
+            color=node_color,
+            colorscale=[
+                [0.0, "#c8dfe0"],
+                [0.4, "#5DCAA5"],
+                [0.75, "#1D9E75"],
+                [1.0, "#085041"],
+            ],
+            cmin=float(min_s),
+            cmax=float(max_s),
+            showscale=True,
+            colorbar=dict(
+                title=dict(text="Tương quan TB", font=dict(size=11, color="#94a3b8")),
+                thickness=12,
+                tickfont=dict(size=10, color="#94a3b8"),
+                outlinewidth=0,
+                x=1.02,
+            ),
+            line=dict(width=2, color="rgba(255,255,255,0.25)"),
+            sizemode="diameter",
+        ),
+        text=tickers_corr,
+        textposition="middle center",
+        textfont=dict(size=9, color="#ffffff", family="Arial Black"),
+        hovertext=node_hover,
+        hovertemplate="%{hovertext}<extra></extra>",
+        showlegend=False,
+    )
+
+    # ── Highlight top-3 node tương quan cao nhất ───────────────
+    top3 = avg_corr.nlargest(3).index.tolist()
+    highlight_trace = go.Scatter(
+        x=[pos[t][0] for t in top3],
+        y=[pos[t][1] for t in top3],
+        mode="markers",
+        marker=dict(
+            size=[node_sizes[t] + 10 for t in top3],
+            color="rgba(0,0,0,0)",
+            line=dict(width=2.5, color="rgba(255,255,255,0.7)"),
+            sizemode="diameter",
+        ),
+        hoverinfo="none",
+        showlegend=False,
+    )
+
+    # ── Annotation: tên node lớn nhất ──────────────────────────
+    top1 = avg_corr.idxmax()
+    annotations = [dict(
+        x=pos[top1][0], y=pos[top1][1] + 0.12,
+        text=f"<b>{top1}</b>",
+        showarrow=False,
+        font=dict(size=11, color="#38bdf8"),
+        bgcolor="rgba(10,14,26,0.6)",
+        borderpad=3,
+    )]
+
+    fig_corr = go.Figure(data=edge_traces + [node_trace, highlight_trace])
+    fig_corr.update_layout(
+        paper_bgcolor="#0a0e1a",
+        plot_bgcolor="#0a0e1a",
+        font_color="#e2e8f0",
+        height=650,
+        margin=dict(t=30, b=30, l=30, r=60),
+        annotations=annotations,
+        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False, range=[-1.2, 1.2]),
+        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False, range=[-1.2, 1.2]),
+        hovermode="closest",
+    )
+
+    # Legend thủ công
+    fig_corr.add_trace(go.Scatter(
+        x=[None], y=[None], mode="markers",
+        marker=dict(size=10,  color="rgba(30,136,229,0.7)"),
+        name="Tương quan dương", showlegend=True
+    ))
+    fig_corr.add_trace(go.Scatter(
+        x=[None], y=[None], mode="markers",
+        marker=dict(size=10, color="rgba(216,90,48,0.7)"),
+        name="Tương quan âm", showlegend=True
+    ))
+    fig_corr.update_layout(
+        legend=dict(
+            x=0.01, y=0.99,
+            bgcolor="rgba(15,22,41,0.8)",
+            bordercolor="rgba(255,255,255,0.1)",
+            borderwidth=1,
+            font=dict(size=11, color="#94a3b8"),
         )
-        n_recent = st.slider("Số phiên hiển thị (dự báo)", 30, 250, 60, step=10)
-    else:
-        selected_symbol = config.SYMBOLS[0]
-        n_recent = 60
-
-    st.divider()
-    st.caption(f"Dữ liệu: {config.START_DATE} → {config.END_DATE}")
-    st.caption(f"Device: `{config.DEVICE}`")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TRANG 1 — TỔNG QUAN
-# ─────────────────────────────────────────────────────────────────────────────
-
-if page == "🏠 Tổng quan":
-    st.title("🏠 Tổng quan thị trường ngân hàng")
-
-    with st.spinner("Đang tải dữ liệu toàn bộ ngân hàng..."):
-        all_stocks = load_all_stocks()
-
-    # Tổng hợp snapshot cuối ngày
-    rows = []
-    for sym, df in all_stocks.items():
-        if df is None or len(df) == 0:
-            continue
-        rows.append({
-            "symbol"    : sym,
-            "name"      : config.BANK_NAMES.get(sym, sym),
-            "close"     : df["close"].iloc[-1],
-            "change_pct": df["daily_return"].iloc[-1] * 100,
-            "volume"    : df["volume"].iloc[-1],
-            "high_3y"   : df["close"].max(),
-            "low_3y"    : df["close"].min(),
-        })
-    snap = pd.DataFrame(rows).dropna()
-
-    if snap.empty:
-        st.warning("Không thể tải dữ liệu. Kiểm tra kết nối mạng.")
-        st.stop()
-
-    # ── Metrics nổi bật ───────────────────────────────────────────────────────
-    top_high = snap.loc[snap["close"].idxmax()]
-    top_low  = snap.loc[snap["close"].idxmin()]
-    top_gain = snap.loc[snap["change_pct"].idxmax()]
-    top_loss = snap.loc[snap["change_pct"].idxmin()]
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("💰 Giá cao nhất hôm nay",
-              f"{top_high['close']:,.1f}k",
-              f"{top_high['symbol']} — {top_high['name']}")
-    c2.metric("📉 Giá thấp nhất hôm nay",
-              f"{top_low['close']:,.1f}k",
-              f"{top_low['symbol']} — {top_low['name']}")
-    c3.metric("🚀 Tăng mạnh nhất",
-              f"+{top_gain['change_pct']:.2f}%",
-              top_gain["symbol"])
-    c4.metric("📉 Giảm mạnh nhất",
-              f"{top_loss['change_pct']:.2f}%",
-              top_loss["symbol"])
-
-    st.divider()
-
-    # ── Bảng giá tổng hợp ────────────────────────────────────────────────────
-    st.subheader("📋 Bảng giá cuối phiên — 30 ngân hàng")
-    display = snap[["symbol", "name", "close", "change_pct", "volume",
-                    "high_3y", "low_3y"]].copy()
-    display.columns = ["Mã", "Tên", "Giá (k)", "% Ngày", "KL",
-                       "Đỉnh 3Y", "Đáy 3Y"]
-    display["% Ngày"] = display["% Ngày"].round(2)
-
-    def color_pct(val):
-        color = "#3fb950" if val > 0 else ("#f85149" if val < 0 else "#8b949e")
-        return f"color: {color}; font-weight: 600"
-
-    st.dataframe(
-        display.style.applymap(color_pct, subset=["% Ngày"]),
-        use_container_width=True, height=450, hide_index=True,
     )
 
-    st.divider()
+    st.plotly_chart(fig_corr, use_container_width=True)
 
-    # ── Ma trận tương quan ────────────────────────────────────────────────────
-    st.subheader("🔗 Ma trận tương quan log return — 30 ngân hàng")
-
-    returns_dict = {}
-    for sym, df in all_stocks.items():
-        if df is not None and len(df) > 50:
-            r = np.log(df["close"] / df["close"].shift(1)).dropna()
-            returns_dict[sym] = r.values
-
-    if len(returns_dict) >= 2:
-        min_len = min(len(v) for v in returns_dict.values())
-        mat     = np.column_stack([v[-min_len:] for v in returns_dict.values()])
-        corr    = np.corrcoef(mat.T)
-        syms    = list(returns_dict.keys())
-
-        fig, ax = plt.subplots(figsize=(12, 10))
-        im      = ax.imshow(corr, cmap="RdYlGn", vmin=-1, vmax=1, aspect="auto")
-        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-
-        ax.set_xticks(range(len(syms)))
-        ax.set_yticks(range(len(syms)))
-        ax.set_xticklabels(syms, rotation=90, fontsize=7)
-        ax.set_yticklabels(syms, fontsize=7)
-        ax.set_title("Correlation Matrix — Log Return", fontsize=12, fontweight="bold",
-                     color="#e6edf3", pad=15)
-
-        # Giá trị trong ô
-        for i in range(len(syms)):
-            for j in range(len(syms)):
-                ax.text(j, i, f"{corr[i,j]:.2f}", ha="center", va="center",
-                        fontsize=5.5, color="#0d1117" if abs(corr[i,j]) > 0.5 else "#c9d1d9")
-
-        fig.tight_layout()
-        st.pyplot(fig)
-        plt.close(fig)
-
-    # ── Bar chart giá cuối phiên ──────────────────────────────────────────────
-    st.subheader("📊 So sánh giá đóng cửa — Toàn bộ ngân hàng")
-    snap_sorted = snap.sort_values("close", ascending=True)
-
-    fig, ax = plt.subplots(figsize=(12, 6))
-    bars    = ax.barh(snap_sorted["symbol"], snap_sorted["close"],
-                      color=["#3fb950" if c >= 0 else "#f85149"
-                             for c in snap_sorted["change_pct"]],
-                      alpha=0.8, edgecolor="#0d1117", linewidth=0.3)
-    ax.set_xlabel("Giá đóng cửa (nghìn đồng)")
-    ax.set_title("Giá đóng cửa phiên gần nhất", fontsize=11, fontweight="bold",
-                 color="#e6edf3")
-    ax.grid(True, axis="x", alpha=0.3, linestyle="--")
-    fig.tight_layout()
-    st.pyplot(fig)
-    plt.close(fig)
+    # Caption giải thích
+    st.caption(
+        "🔵 Kích thước node = mức độ liên kết trung bình  |  "
+        "🟢 Cạnh xanh = tương quan dương  |  🔴 Cạnh đỏ = tương quan âm  |  "
+        f"Ngưỡng hiển thị: |corr| ≥ {THRESHOLD}"
+    )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TRANG 2 — CHI TIẾT NGÂN HÀNG
-# ─────────────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════
+# TRANG 2: Ngân hàng
+# ════════════════════════════════════════════════════════════
+elif page == "🔍 Ngân hàng":
+    ticker = st.selectbox(
+        "Chọn ngân hàng",
+        BANK_TICKERS,
+        format_func=lambda t: f"{t} — {BANK_NAMES.get(t, t)}"
+    )
 
-elif page == "📈 Chi tiết ngân hàng":
-    sym       = selected_symbol
-    bank_name = config.BANK_NAMES.get(sym, sym)
+    sub = df[df["ticker"] == ticker].sort_values("time").copy()
+    st.markdown(f"## 🏦 {BANK_NAMES.get(ticker, ticker)} ({ticker})")
 
-    st.title(f"📈 {sym} — {bank_name}")
-
-    df = load_stock(sym)
-    if df is None:
-        st.error(f"Không thể tải dữ liệu cho {sym}.")
-        st.stop()
-
-    # Metrics nhanh
-    last   = df.iloc[-1]
-    prev   = df.iloc[-2]
-    delta  = (last["close"] - prev["close"]) / prev["close"] * 100
-    arrow  = "▲" if delta >= 0 else "▼"
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Giá đóng cửa",    f"{last['close']:,.1f}k",       f"{arrow} {abs(delta):.2f}%")
-    col2.metric("MA20",             f"{last['ma20']:,.1f}k")
-    col3.metric("Khối lượng",       f"{last['volume']:,.0f}")
-    col4.metric("Số phiên dữ liệu", f"{len(df)}")
-
-    st.divider()
-
-    # ── Tab 1: Phân tích dữ liệu ──────────────────────────────────────────────
-    tab1, tab2 = st.tabs(["📊 Phân tích dữ liệu", "🔮 Dự báo ML"])
+    tab1, tab2, tab3 = st.tabs(["📈 Phân tích dữ liệu", "🔮 Dự báo", "📊 Đánh giá mô hình"])
 
     with tab1:
-        st.subheader("Stock Price Over Time")
-        st.pyplot(fig_price(df))
+        col_a, col_b = st.columns(2)
 
-        c1, c2 = st.columns(2)
-        with c1:
+        with col_a:
+            st.subheader("Stock Price Over Time")
+            fig1 = go.Figure()
+            fig1.add_trace(go.Scatter(
+                x=sub["time"], y=sub["close"],
+                mode="lines", name="Giá đóng cửa",
+                line=dict(color="#38bdf8", width=1.5)
+            ))
+            fig1.add_trace(go.Scatter(
+                x=sub["time"], y=sub["ma21"],
+                mode="lines", name="MA 21",
+                line=dict(color="#f59e0b", width=1, dash="dash")
+            ))
+            fig1.update_layout(
+                paper_bgcolor="#111827", plot_bgcolor="#111827",
+                font_color="#e2e8f0", height=320,
+                margin=dict(t=10, b=10), legend=dict(orientation="h")
+            )
+            st.plotly_chart(fig1, use_container_width=True)
+
+        with col_b:
             st.subheader("Log-transformed Price")
-            st.pyplot(fig_log_price(df))
-        with c2:
+            fig2 = go.Figure(go.Scatter(
+                x=sub["time"], y=sub["close_log"],
+                mode="lines", line=dict(color="#a78bfa", width=1.5)
+            ))
+            fig2.update_layout(
+                paper_bgcolor="#111827", plot_bgcolor="#111827",
+                font_color="#e2e8f0", height=320, margin=dict(t=10, b=10)
+            )
+            st.plotly_chart(fig2, use_container_width=True)
+
+        col_c, col_d = st.columns(2)
+
+        with col_c:
             st.subheader("Daily Returns Over Time")
-            st.pyplot(fig_daily_return(df))
+            colors = np.where(sub["daily_return"] >= 0, "#34d399", "#f87171")
+            fig3 = go.Figure(go.Bar(
+                x=sub["time"], y=sub["daily_return"],
+                marker_color=colors
+            ))
+            fig3.update_layout(
+                paper_bgcolor="#111827", plot_bgcolor="#111827",
+                font_color="#e2e8f0", height=320, margin=dict(t=10, b=10)
+            )
+            st.plotly_chart(fig3, use_container_width=True)
 
-        st.subheader("Volume Over Time")
-        st.pyplot(fig_volume(df))
+        with col_d:
+            st.subheader("Volume Over Time")
+            fig4 = go.Figure(go.Bar(
+                x=sub["time"], y=sub["volume"],
+                marker_color="#60a5fa"
+            ))
+            fig4.update_layout(
+                paper_bgcolor="#111827", plot_bgcolor="#111827",
+                font_color="#e2e8f0", height=320, margin=dict(t=10, b=10)
+            )
+            st.plotly_chart(fig4, use_container_width=True)
 
-    # ── Tab 2: Dự báo ML ─────────────────────────────────────────────────────
-    with tab2:
-        st.subheader("Dự báo giá — Model tốt nhất (theo RMSE thấp nhất)")
+        with tab2:
+            scaler = load_scaler(ticker)
+            if scaler is None:
+                st.warning("⚠️ Chưa có mô hình đã huấn luyện cho ngân hàng này.")
+                st.stop()
 
-        best_df = load_best_models_csv()
-        if best_df is None:
-            st.info("💡 Chưa có kết quả đánh giá. Hãy chạy `evaluate.py` để tự động chọn model tốt nhất.")
+            prices       = sub["close"].values
+            prices_dates = sub["time"].values
+            colors_model = {"Linear": "#38bdf8", "DLinear": "#f59e0b", "NLinear": "#34d399"}
 
-        for window in config.INPUT_WINDOWS:
-            horizon_label = config.PRED_HORIZONS.get(window, f"{window}d")
-            st.markdown(f"### 🗓️ Dự báo {horizon_label}")
+            # ── Hàm backtest: trượt từng bước 1, lấy giá trị đầu tiên của dự đoán ──
+            def backtest(ticker, pred_len, prices, scaler):
+                scaled = scaler.transform(prices.reshape(-1, 1)).flatten()
+                split  = int(len(scaled) * 0.8)
 
-            fig, best_name, preds, actuals = fig_forecast(sym, window, n_recent)
+                results = {name: [] for name in MODEL_REGISTRY}
+                for i in range(split, len(scaled) - pred_len + 1):
+                    if i < INPUT_LEN:
+                        continue
+                    x_in = torch.tensor(scaled[i - INPUT_LEN: i], dtype=torch.float32).unsqueeze(0)
+                    for name in MODEL_REGISTRY:
+                        m = load_model_cached(ticker, name, pred_len)
+                        if m is None:
+                            continue
+                        with torch.no_grad():
+                            out = m(x_in).numpy().flatten()
+                        inv = scaler.inverse_transform(out.reshape(-1, 1)).flatten()
+                        results[name].append(float(inv[0]))  # chỉ lấy bước đầu tiên
 
-            # Dự báo phiên tiếp theo
-            forecast_price, _ = next_day_forecast(sym, window)
-            if forecast_price is not None:
-                last_close = df["close"].iloc[-1]
-                diff_pct   = (forecast_price - last_close) / last_close * 100
-                sign       = "▲" if diff_pct >= 0 else "▼"
-                color      = "green" if diff_pct >= 0 else "red"
-                st.markdown(
-                    f"**Model sử dụng:** `{best_name}`  "
-                    f"| **Giá dự báo phiên tới:** `{forecast_price:,.1f}k VND` "
-                    f"<span style='color:{color};font-weight:700'>{sign} {abs(diff_pct):.2f}%</span>",
-                    unsafe_allow_html=True,
+                return {k: np.array(v) for k, v in results.items() if v}
+
+            for label, pred_len in PRED_LENS.items():
+                st.subheader(f"📅 Dự báo {label}")
+                preds = predict(ticker, pred_len, prices, scaler)
+                if not preds:
+                    st.info("Chưa có mô hình, hãy chạy build_model.py trước.")
+                    continue
+
+                # ── Tính backtest ──────────────────────────────────────────
+                bt_preds  = backtest(ticker, pred_len, prices, scaler)
+                split_idx = int(len(prices) * 0.8)
+                # step=1: mỗi ngày trong tập test là 1 điểm dự báo
+                bt_indices = list(range(split_idx, len(prices) - pred_len + 1))
+                bt_dates   = [prices_dates[i] for i in bt_indices]
+                bt_actuals = [prices[i]       for i in bt_indices]
+
+                # ── Dự báo tương lai ───────────────────────────────────────
+                last_date   = sub["time"].max()
+                future_days = pd.bdate_range(start=last_date + pd.Timedelta(days=1), periods=pred_len)
+
+                fig = go.Figure()
+
+                # Giá thực tế
+                fig.add_trace(go.Scatter(
+                    x=sub["time"], y=sub["close"],
+                    mode="lines", name="Giá thực tế",
+                    line=dict(color="#94a3b8", width=1.5)
+                ))
+
+                # Đường dự báo backtest — liên tục từ đầu tập test đến hôm nay
+                for name, vals in bt_preds.items():
+                    n = min(len(vals), len(bt_dates))
+                    if n == 0:
+                        continue
+                    fig.add_trace(go.Scatter(
+                        x=bt_dates[:n], y=vals[:n],
+                        mode="lines", name=name,
+                        line=dict(color=colors_model.get(name, "#fff"), width=1, dash="4px,4px")
+                    ))
+
+                # Đường kẻ dọc phân tách lịch sử / tương lai
+                fig.add_vline(
+                    x=pd.Timestamp(last_date).timestamp() * 1000,
+                    line_dash="dash", line_color="#64748b", line_width=1.5,
+                    annotation_text="Hôm nay", annotation_position="top right",
+                    annotation_font_color="#94a3b8"
                 )
 
-            st.pyplot(fig)
-            plt.close(fig)
-            st.divider()
+                # Dự báo tương lai — nối liền từ điểm cuối
+                for name, vals in preds.items():
+                    connect_x = [last_date] + list(future_days)
+                    connect_y = [prices[-1]] + list(vals)
+                    fig.add_trace(go.Scatter(
+                        x=connect_x, y=connect_y,
+                        mode="lines", name=f"{name} →",
+                        line=dict(color=colors_model.get(name, "#fff"), width=1.5, dash="dash"),
+                        marker=dict(size=7),
+                        showlegend=False
+                    ))
 
+                fig.update_layout(
+                    paper_bgcolor="#111827", plot_bgcolor="#111827",
+                    font_color="#e2e8f0", height=450,
+                    margin=dict(t=30, b=10),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+                    hovermode="x unified"
+                )
+                st.plotly_chart(fig, use_container_width=True)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TRANG 3 — ĐÁNH GIÁ MÔ HÌNH
-# ─────────────────────────────────────────────────────────────────────────────
+                table_data = {"Ngày": future_days.strftime("%d/%m/%Y")}
+                for name, vals in preds.items():
+                    table_data[name] = [f"{v:,.0f}" for v in vals]
+                st.dataframe(pd.DataFrame(table_data), use_container_width=True, hide_index=True)
 
-elif page == "🤖 Đánh giá mô hình":
-    st.title("🤖 Đánh giá hiệu suất mô hình")
-    st.caption("RMSE · MAE · R²  —  tập kiểm tra độc lập 20% cuối")
-
-    summary = load_summary_csv()
-    if summary is None:
-        st.warning("Chưa có file `logs/summary.csv`. Hãy chạy `python evaluate.py` trước.")
-        st.code("python evaluate.py")
-        st.stop()
-
-    # Chuẩn hoá tên cột
-    summary.columns = [c.lower() for c in summary.columns]
-
-    # ── Bộ lọc ───────────────────────────────────────────────────────────────
-    f1, f2, f3 = st.columns(3)
-    sel_sym    = f1.multiselect("Lọc mã",    options=sorted(summary["symbol"].unique()),
-                                 default=sorted(summary["symbol"].unique())[:5])
-    sel_win    = f2.multiselect("Lọc window", options=sorted(summary["window"].unique()),
-                                 default=sorted(summary["window"].unique()))
-    sel_mod    = f3.multiselect("Lọc model",  options=sorted(summary["model"].unique()),
-                                 default=sorted(summary["model"].unique()))
-
-    mask = (
-        summary["symbol"].isin(sel_sym if sel_sym else summary["symbol"].unique()) &
-        summary["window"].isin(sel_win if sel_win else summary["window"].unique()) &
-        summary["model"].isin(sel_mod if sel_mod else summary["model"].unique())
-    )
-    filtered = summary[mask].copy()
-
-    # ── Metrics tổng hợp ─────────────────────────────────────────────────────
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Tổng cấu hình", f"{len(filtered)}")
-    m2.metric("RMSE trung bình", f"{filtered['rmse'].mean():.4f}")
-    m3.metric("MAE trung bình",  f"{filtered['mae'].mean():.4f}")
-    m4.metric("R² trung bình",   f"{filtered['r2'].mean():.4f}")
-
-    st.divider()
-
-    # ── Bảng chi tiết ────────────────────────────────────────────────────────
-    st.subheader("📋 Bảng chi tiết RMSE / MAE / R²")
-
-    def highlight_best(s):
-        """Tô màu RMSE thấp nhất và R2 cao nhất trong nhóm."""
-        if s.name in ["rmse", "mae"]:
-            is_best = s == s.min()
-        elif s.name == "r2":
-            is_best = s == s.max()
+    # ── Tab 3: Đánh giá mô hình (đọc từ model_evaluation.csv) ──
+    with tab3:
+        EVAL_PATH = "data/model_evaluation.csv"
+        if not os.path.exists(EVAL_PATH):
+            st.warning("⚠️ Chưa có file đánh giá. Hãy chạy `src/evaluate.py` trước.")
+            st.code("python src/evaluate.py", language="bash")
         else:
-            return [""] * len(s)
-        return ["background-color: #1a3a2a; color: #3fb950; font-weight: 700"
-                if v else "" for v in is_best]
+            eval_df = pd.read_csv(EVAL_PATH)
+            # Lọc theo ticker đang chọn
+            df_ticker = eval_df[eval_df["ticker"] == ticker].copy()
 
-    st.dataframe(
-        filtered.sort_values(["symbol", "window", "rmse"])
-                .style.apply(highlight_best, subset=["rmse", "mae", "r2"]),
-        use_container_width=True, height=420, hide_index=True,
-    )
+            if df_ticker.empty:
+                st.info(f"Không có dữ liệu đánh giá cho {ticker}.")
+            else:
+                st.markdown("### 📊 Kết quả đánh giá trên tập kiểm tra (20% dữ liệu cuối)")
+                st.caption("Nguồn: data/model_evaluation.csv — sinh bởi evaluate.py")
 
-    st.divider()
+                colors_model = {"Linear": "#38bdf8", "DLinear": "#f59e0b", "NLinear": "#34d399"}
 
-    # ── Bar chart RMSE theo model ─────────────────────────────────────────────
-    st.subheader("📊 So sánh RMSE trung bình theo mô hình × window")
-    grouped = (filtered.groupby(["model", "window"])["rmse"]
-                       .mean().reset_index())
+                HORIZON_LABELS = {1: "1 ngày (1 phiên)", 5: "1 tuần (5 phiên)", 21: "1 tháng (21 phiên)"}
 
-    windows = sorted(grouped["window"].unique())
-    models  = ["LSTM", "DLinear", "NLinear"]
-    x       = np.arange(len(windows))
-    width   = 0.25
-    colors_map = {"LSTM": "#e74c3c", "DLinear": "#2ecc71", "NLinear": "#3498db"}
+                for pred_len, label in HORIZON_LABELS.items():
+                    df_h = df_ticker[df_ticker["pred_len"] == pred_len].copy()
+                    if df_h.empty:
+                        continue
 
-    fig, ax = plt.subplots(figsize=(9, 4))
-    for i, m in enumerate(models):
-        sub  = grouped[grouped["model"] == m].sort_values("window")
-        vals = sub["rmse"].values if len(sub) == len(windows) else [0] * len(windows)
-        ax.bar(x + i * width, vals, width,
-               label=m, color=colors_map[m], alpha=0.85, edgecolor="#0d1117")
+                    st.markdown(f"#### 📅 {label}")
 
-    ax.set_xticks(x + width)
-    ax.set_xticklabels([config.PRED_HORIZONS.get(w, str(w)) for w in windows], fontsize=9)
-    ax.set_ylabel("RMSE trung bình")
-    ax.set_title("RMSE theo Model × Horizon", fontsize=11, fontweight="bold", color="#e6edf3")
-    ax.legend(fontsize=9)
-    ax.grid(True, axis="y", alpha=0.3, linestyle="--")
-    fig.tight_layout()
-    st.pyplot(fig)
-    plt.close(fig)
+                    # ── Bảng metrics ──────────────────────────────────
+                    df_display = df_h[["model", "RMSE", "MAE", "R2"]].copy()
+                    df_display.columns = ["Mô hình", "RMSE ", "MAE ", "R²"]
 
-    # ── Scatter RMSE vs R2 ────────────────────────────────────────────────────
-    st.subheader("🔍 Scatter: RMSE vs R² (toàn bộ cấu hình)")
-    fig, ax = plt.subplots(figsize=(8, 4))
-    for m in models:
-        sub = filtered[filtered["model"] == m]
-        ax.scatter(sub["rmse"], sub["r2"], label=m,
-                   color=colors_map[m], alpha=0.7, s=40, edgecolors="#0d1117", linewidth=0.3)
-    ax.set_xlabel("RMSE (thấp hơn = tốt hơn)")
-    ax.set_ylabel("R² (cao hơn = tốt hơn)")
-    ax.set_title("RMSE vs R²", fontsize=11, fontweight="bold", color="#e6edf3")
-    ax.axhline(0, color="#8b949e", linewidth=0.8, linestyle="--")
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3, linestyle="--")
-    fig.tight_layout()
-    st.pyplot(fig)
-    plt.close(fig)
+                    # Highlight mô hình tốt nhất (RMSE thấp nhất)
+                    best_idx  = df_h["RMSE"].idxmin()
+                    best_name = df_h.loc[best_idx, "model"]
 
-    st.divider()
+                    def highlight_best(row):
+                        return ["background-color: #1e3a2f; color: #34d399; font-weight:bold"
+                                if row["Mô hình"] == best_name else "" for _ in row]
 
-    # ── Model tốt nhất ────────────────────────────────────────────────────────
-    st.subheader("🏆 Model tốt nhất cho từng mã × window (RMSE thấp nhất)")
-    best_df = load_best_models_csv()
-    if best_df is not None:
-        sel_best = best_df[best_df["symbol"].isin(
-            sel_sym if sel_sym else best_df["symbol"].unique()
-        )]
-        # Pivot table
-        pivot = sel_best.pivot_table(
-            index="symbol", columns="window", values="model", aggfunc="first"
-        )
-        pivot.columns = [config.PRED_HORIZONS.get(c, str(c)) for c in pivot.columns]
+                    styled = (df_display.style
+                              .apply(highlight_best, axis=1)
+                              .format({"RMSE ": "{:,.0f}", "MAE ": "{:,.0f}", "R²": "{:.4f}"}))
+                    st.dataframe(styled, use_container_width=True, hide_index=True)
 
-        def color_model(val):
-            m = {"LSTM": "#3a1f1f", "DLinear": "#1a3a22", "NLinear": "#1a263a"}
-            return f"background-color: {m.get(val, '')}; color: #e6edf3; font-weight: 600"
+                
+                    # ── Biểu đồ RMSE so sánh các mô hình ─────────────
+                    model_names = df_h["model"].tolist()
+                    rmse_vals   = df_h["RMSE"].tolist()
+                    bar_colors  = [
+                        "#34d399" if n == best_name else colors_model.get(n, "#94a3b8")
+                        for n in model_names
+                    ]
 
-        st.dataframe(
-            pivot.style.applymap(color_model),
-            use_container_width=True,
-        )
-    else:
-        st.info("Chưa có file `logs/best_models.csv`.")
+                    col_left, col_right = st.columns(2)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TRANG 4 — TIN TỨC
-# ─────────────────────────────────────────────────────────────────────────────
 
+# ════════════════════════════════════════════════════════════
+# TRANG 3: TIN TỨC  (RSS — CafeF / VnExpress / Vietstock)
+# ════════════════════════════════════════════════════════════
 elif page == "📰 Tin tức":
-    sym       = selected_symbol
-    bank_name = config.BANK_NAMES.get(sym, sym)
+    st.title("📰 Tin tức biến động ngân hàng")
+    st.caption("Nguồn: CafeF · VnExpress · Vietstock (RSS) — cập nhật mỗi 20 phút")
 
-    st.title(f"📰 Tin tức — {sym} ({bank_name})")
+    col_left, col_right = st.columns([2, 1])
 
-    if config.NEWS_API_KEY == "YOUR_NEWSAPI_KEY_HERE":
-        st.warning(
-            "⚠️  Chưa cấu hình API key NewsAPI.\n\n"
-            "1. Đăng ký miễn phí tại [newsapi.org](https://newsapi.org)\n"
-            "2. Mở file `config.py` và thay `YOUR_NEWSAPI_KEY_HERE` bằng key thật.\n"
-            "3. Reload trang."
+    with col_left:
+        ticker_news = st.selectbox(
+            "Chọn ngân hàng",
+            BANK_TICKERS,
+            format_func=lambda t: f"{t} — {BANK_NAMES.get(t, t)}",
+            key="news_ticker"
         )
+
+    with col_right:
+        if st.button("🔄 Làm mới tin tức"):
+            st.cache_data.clear()
+            st.rerun()
+
+    bank_name = BANK_NAMES.get(ticker_news, ticker_news)
+    st.subheader(f"🏦 Tin tức: {bank_name} ({ticker_news})")
+
+    with st.spinner("Đang tải tin tức từ RSS..."):
+        news_list = fetch_news(ticker_news)
+
+    if not news_list:
+        st.info("Không tìm thấy tin tức gần đây.")
     else:
-        with st.spinner(f"Đang tải tin tức về {sym}..."):
-            articles = fetch_news(sym, bank_name)
-
-        if not articles:
-            st.info("Không tìm thấy tin tức gần đây. Thử đổi từ khoá hoặc kiểm tra API key.")
-        else:
-            st.caption(f"Tìm thấy {len(articles)} bài viết gần đây")
-            for art in articles:
-                title       = art.get("title",       "Không có tiêu đề")
-                description = art.get("description", "")
-                url         = art.get("url",         "#")
-                source      = art.get("source", {}).get("name", "")
-                published   = art.get("publishedAt", "")[:10]
-
-                st.markdown(f"""
-                <div class="news-card">
-                    <div class="news-title"><a href="{url}" target="_blank"
-                        style="text-decoration:none; color:#58a6ff;">{title}</a></div>
-                    <div class="news-meta">📰 {source} &nbsp;|&nbsp; 🗓️ {published}</div>
-                    <div class="news-desc">{description}</div>
-                </div>
-                """, unsafe_allow_html=True)
-
-    # Biến động giá gần đây ngay dưới tin tức
-    st.divider()
-    st.subheader(f"📈 Giá {sym} — 90 phiên gần nhất")
-    df = load_stock(sym)
-    if df is not None:
-        df_recent = df.tail(90)
-        fig, ax   = plt.subplots(figsize=(11, 3.5))
-        ax.plot(df_recent["time"], df_recent["close"],
-                color="#58a6ff", linewidth=1.8)
-        ax.fill_between(df_recent["time"], df_recent["close"],
-                        df_recent["close"].min() * 0.995,
-                        color="#58a6ff", alpha=0.12)
-        ax.set_ylabel("Giá (nghìn đồng)")
-        _date_axis(ax)
-        ax.xaxis.set_major_locator(mdates.MonthLocator())
-        ax.xaxis.set_major_formatter(mdates.DateFormatter("%m/%Y"))
-        fig.tight_layout()
-        st.pyplot(fig)
-        plt.close(fig)
+        st.caption(f"Tìm thấy {len(news_list)} bài viết")
+        for item in news_list:
+            summary_html = (
+                f"<div style='color:#94a3b8; font-size:13px; margin-top:6px;'>{item['summary']}</div>"
+                if item.get("summary") else ""
+            )
+            st.markdown(f"""
+            <div class="news-card">
+                <a href="{item['url']}" target="_blank">{item['title']}</a>
+                {summary_html}
+                <div class="news-meta">📅 {item['published']} &nbsp;|&nbsp; 📰 {item['source']}</div>
+            </div>
+            """, unsafe_allow_html=True)
