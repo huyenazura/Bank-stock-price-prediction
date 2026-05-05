@@ -5,10 +5,11 @@ import os
 
 # ------ Danh sách 20 ngân hàng ------
 BANK_TICKERS = [
-    "VCB", "BID", "CTG", "TCB", "MBB",
-    "ACB", "VPB", "STB", "HDB", "TPB",
-    "VIB", "MSB", "OCB", "SHB", "LPB",
-    "EIB", "NAB", "PGB", "ABB", "BVB"
+    "VCB","BID","CTG","TCB",
+    "MBB","VPB","ACB","HDB",
+    "STB","SHB","VIB","TPB",
+    "MSB","OCB","LPB","SSB",
+    "ABB","BVB","KLB","EIB"
 ]
 
 # ------ Khoảng thời gian 3 năm ------

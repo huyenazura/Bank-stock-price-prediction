@@ -66,15 +66,19 @@ def train_all(data_path="data/processed/clean_data.csv"):
         sub    = df[df["ticker"] == ticker].sort_values("time")
         prices = sub["close"].values
 
+      # Chia train / test = 80 / 20 trước
+        split = int(len(prices) * 0.8)
+
+        # Chỉ fit scaler trên train set
         scaler = MinMaxScaler()
-        prices_scaled = scaler.fit_transform(prices.reshape(-1, 1)).flatten()
+        scaler.fit(prices[:split].reshape(-1, 1))
+
+        # Transform toàn bộ dữ liệu bằng scaler đã fit trên train
+        prices_scaled = scaler.transform(prices.reshape(-1, 1)).flatten()
 
         # Lưu scaler
         with open(f"data/models/{ticker}_scaler.pkl", "wb") as f:
             pickle.dump(scaler, f)
-
-        # Chia train / test = 80 / 20
-        split = int(len(prices_scaled) * 0.8)
 
         for pred_len in PRED_LENS:
             X, y = make_sequences(prices_scaled, INPUT_LEN, pred_len)
